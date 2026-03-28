@@ -20,6 +20,7 @@ public class MinimalQuicServer {
     private boolean printSelf = false;
     private static int QUIC_PORT = 443;
     private static final int MAX_PACKET_SIZE = 1500;
+    private final String labelTls = "tls13 ";
   
     private DatagramChannel channel;
     private Selector selector;
@@ -28,13 +29,24 @@ public class MinimalQuicServer {
     private static int AUTH_TAG_LENGTH = 16;
       
     // QUIC 1 (RFC 9000)
-    private static final byte[] QUIC_VERSION_1 = {0x00, 0x00, 0x00, 0x01};
+    private static final byte[] QUIC_VERSION_1 = {(byte)0x00, (byte)0x00, (byte)0x00, (byte)0x01};
     private static final byte[] INITIAL_SALT_V1 = {
         (byte)0x38, (byte)0x76, (byte)0x2c, (byte)0xf7,
         (byte)0xf5, (byte)0x59, (byte)0x34, (byte)0xb3,
         (byte)0x4d, (byte)0x17, (byte)0x9a, (byte)0xe6,
         (byte)0xa4, (byte)0xc8, (byte)0x0c, (byte)0xad,
         (byte)0xcc, (byte)0xbb, (byte)0x7f, (byte)0x0a
+    };
+
+    // QUIC 2 (RFC 9369)
+    private static final byte[] QUIC_VERSION_2 = {(byte)0x6b, (byte)0x33, (byte)0x43, (byte)0xcf};
+    private static final byte[] INITIAL_SALT_V2 = {
+        (byte)0x0d, (byte)0xed, (byte)0xe3, (byte)0xde,
+        (byte)0xf7, (byte)0xa0, (byte)0xf7, (byte)0xc7,
+        (byte)0x31, (byte)0x0b, (byte)0x03, (byte)0x35,
+        (byte)0x0a, (byte)0x17, (byte)0x38, (byte)0x31,
+        (byte)0x0d, (byte)0x16, (byte)0xed, (byte)0xeb,
+        (byte)0x1e, (byte)0x38, (byte)0x48, (byte)0x03
     };
   
     private static final String HMAC_SHA256 = "HmacSHA256";
@@ -166,25 +178,66 @@ public class MinimalQuicServer {
                 return null;
             }
           
-            packet.type = (byte)((firstByte & 0x30) >> 4);
-            packet.isInitial = (packet.type == 0x00);
-            packet.pnLengthFromHeader = (firstByte & 0x03) + 1;
+            //packet.type = (byte)((firstByte & 0x30) >> 4);
+            //packet.isInitial = (packet.type == 0x00);
           
             System_out_println(" \r\n\r\nNEW\r\nFirst byte: 0x" + String.format("%02X", firstByte));
-            System_out_println(" Packet type: " + packet.type + " (0=Initial)");
+            //System_out_println(" Packet type: " + packet.type + " (0=Initial)");
           
             packet.version = new byte[4];
             buffer.get(packet.version);
             System_out_println(" Version: " + bytesToHex(packet.version, 4));
           
             // QUIC v1
-            boolean isQuicV1 = true;
-            for (int i = 0; i < 4; i++) {
-                if (packet.version[i] != QUIC_VERSION_1[i]) {
-                    isQuicV1 = false;          
+            packet.isVersion = 1;
+            for (int i = 0; i < QUIC_VERSION_1.length; i++) {
+                if (packet.version[i] != QUIC_VERSION_1[i]) { 
+                    packet.isVersion = 2;
+                    for (i = 0; i < QUIC_VERSION_2.length; i++) {
+                        if (packet.version[i] != QUIC_VERSION_2[i]) {
+                           packet.isVersion = 0;
+                           break;
+                        }
+                    }
                     break;
                 }
             }
+
+            packet.type = (byte)((firstByte & 0x30) >> 4);
+
+            String typeName;
+            boolean isInitial = false;
+
+            if (packet.isVersion == 1) {
+                switch (packet.type) {
+                    case 0x00: 
+                      typeName = "Initial";   
+                      isInitial = true; 
+                    break;
+                    case 0x01: typeName = "0-RTT";     break;
+                    case 0x02: typeName = "Handshake"; break;
+                    case 0x03: typeName = "Retry";     break;
+                    default:   typeName = "Unknown";   break;
+                }
+            } else if (packet.isVersion == 2) { //isQuicV2(packet.version)
+                switch (packet.type) {
+                    case 0x01: 
+                      typeName = "Initial";   
+                      isInitial = true;
+                    break;
+                    case 0x02: typeName = "0-RTT";     break;
+                    case 0x03: typeName = "Handshake"; break;
+                    case 0x00: typeName = "Retry";     break;
+                    default:   typeName = "Unknown";   break;
+                }
+            } else {
+                typeName = "Unsupported version";
+            }
+
+            packet.isInitial = isInitial;
+            System_out_println(" Packet type: 0x" + String.format("%02X", packet.type) + 
+                               " → " + typeName + " (version " + 
+                               packet.isVersion + ")");
 
             int dcidLength = buffer.get() & 0xFF;
             System_out_println(" DCID length byte: 0x" + String.format("%02X", dcidLength) + " = " + dcidLength + " bytes");
@@ -207,8 +260,8 @@ public class MinimalQuicServer {
             buffer.get(packet.sourceConnectionId);
         
            
-            if (!isQuicV1) {
-                System_out_println(" Not QUIC v1 packet");    
+            if (packet.isVersion == 0) {
+                System_out_println(" Not QUIC v1 or v2 packet");    
                 sendVersionNegotiation(packet, clientAddress);   
                 return null;
             }         
@@ -337,11 +390,12 @@ public class MinimalQuicServer {
       //int oldPosition = buffer.position();
       //for(;;) {
         //System_out_println(" 1. Computing initial secrets...");
-        byte[] initialSecret = hkdfExtract(INITIAL_SALT_V1, packet.destinationConnectionId);      
-        byte[] clientInitialSecret = hkdfExpandLabel(initialSecret, "client in", new byte[0], 32);        
-        byte[] clientKey = hkdfExpandLabel(clientInitialSecret, "quic key", new byte[0], 16);
-        byte[] clientIv = hkdfExpandLabel(clientInitialSecret, "quic iv", new byte[0], 12);
-        byte[] clientHpKey = hkdfExpandLabel(clientInitialSecret, "quic hp", new byte[0], 16);
+        byte[] salt = packet.isVersion == 1 ? INITIAL_SALT_V1 : INITIAL_SALT_V2;
+        byte[] initialSecret = hkdfExtract(salt, packet.destinationConnectionId);      
+        byte[] clientInitialSecret = hkdfExpandLabel(initialSecret, getInLabel(packet.isVersion, true), new byte[0], 32);        
+        byte[] clientKey = hkdfExpandLabel(clientInitialSecret, getKeyLabel(packet.isVersion), new byte[0], 16);
+        byte[] clientIv = hkdfExpandLabel(clientInitialSecret, getIvLabel(packet.isVersion), new byte[0], 12);
+        byte[] clientHpKey = hkdfExpandLabel(clientInitialSecret, getHpLabel(packet.isVersion), new byte[0], 16);
     
         System_out_println(" Initial Secret (own HKDF-Extract): " + bytesToHex(initialSecret));    
         System_out_println(" Client Initial Secret (with 'client in' label): " + bytesToHex(clientInitialSecret));        
@@ -460,7 +514,7 @@ public class MinimalQuicServer {
     }
      
     private byte[] hkdfExpandLabel(byte[] secret, String label, byte[] context, int length) throws Exception {
-        byte[] labelBytes = ("tls13 " + label).getBytes();
+        byte[] labelBytes = (labelTls + label).getBytes();
         byte[] hkdfLabel = new byte[2 + 1 + labelBytes.length + 1 + context.length];
         hkdfLabel[0] = (byte)(length >> 8);
         hkdfLabel[1] = (byte)length;
@@ -722,8 +776,8 @@ public class MinimalQuicServer {
 
         // CONNECTION_CLOSE
         if (clientAddress != null) {
-            sendConnectionClose(decrypted.packet, state, clientAddress);
-            //sendVersionNegotiation(decrypted.packet, clientAddress);
+            //sendConnectionClose(decrypted.packet, state, clientAddress);
+            sendVersionNegotiation(decrypted.packet, clientAddress);
         }
     }
   
@@ -738,12 +792,15 @@ public class MinimalQuicServer {
         byte[] scid = incomingPacket.destinationConnectionId; // Echo client's DCID as SCID
         byte scidLen = (byte) (scid.length & 0xFF);
 
-        // Supported versions: empty list to force fallback (or add unsupported versions)
-        //byte[] supportedVersions = new byte[0]; // Empty for no support, forcing fallback
+        // Supported versions: v1 and v2
         byte[] supportedVersions = new byte[] { 
-            0x0a, 0x0a, 0x0a, 0x0a,  // 0x0a0a0a0a 
-            0x1a, 0x1a, 0x1a, 0x1a   // 0x1a1a1a1a 
+            0x00, 0x00, 0x00, 0x01,  // QUIC v1
+            0x6b, 0x33, 0x43, (byte)0xcf   // QUIC v2
         };
+        //byte[] supportedVersions = new byte[] {  
+            //0x0a, 0x0a, 0x0a, 0x0a,  // 0x0a0a0a0a 
+            //0x1a, 0x1a, 0x1a, 0x1a   // 0x1a1a1a1a 
+        //};    
         ByteArrayOutputStream packetStream = new ByteArrayOutputStream();
         packetStream.write(headerForm);
         packetStream.write(version);
@@ -758,7 +815,7 @@ public class MinimalQuicServer {
         // Send
         ByteBuffer sendBuffer = ByteBuffer.wrap(vnPacket);
         channel.send(sendBuffer, clientAddress);
-        System.out.println("Sent VERSION_NEGOTIATION to " + clientAddress + " with empty supported versions to force fallback");
+        System.out.println("Sent VERSION_NEGOTIATION to " + clientAddress + " with supported versions v1 and v2");
     }  
     
     private int encodePnLen(long packetNumber) {
@@ -817,11 +874,12 @@ public class MinimalQuicServer {
       
             System_out_println(" SCID back: " + bytesToHex(scid)); 
             // 1. Compute Server Initial Secrets
-            byte[] initialSecret = hkdfExtract(INITIAL_SALT_V1, clientPacket.destinationConnectionId);
-            byte[] serverSecret = hkdfExpandLabel(initialSecret, "server in", new byte[0], 32);
-            byte[] serverKey = hkdfExpandLabel(serverSecret, "quic key", new byte[0], 16);
-            byte[] serverIv  = hkdfExpandLabel(serverSecret, "quic iv",  new byte[0], 12);
-            byte[] serverHp  = hkdfExpandLabel(serverSecret, "quic hp",  new byte[0], 16);
+            byte[] salt = clientPacket.isVersion == 1 ? INITIAL_SALT_V1 : INITIAL_SALT_V2;
+            byte[] initialSecret = hkdfExtract(salt, clientPacket.destinationConnectionId);
+            byte[] serverSecret = hkdfExpandLabel(initialSecret, getInLabel(clientPacket.isVersion, false), new byte[0], 32);
+            byte[] serverKey = hkdfExpandLabel(serverSecret, getKeyLabel(clientPacket.isVersion), new byte[0], 16);
+            byte[] serverIv  = hkdfExpandLabel(serverSecret, getIvLabel(clientPacket.isVersion),  new byte[0], 12);
+            byte[] serverHp  = hkdfExpandLabel(serverSecret, getHpLabel(clientPacket.isVersion),  new byte[0], 16);
     
             long packetNumber = state.packetNumberSent++; 
             int pnLength = encodePnLen(packetNumber); //4;   //      
@@ -834,11 +892,20 @@ public class MinimalQuicServer {
     
             // 3. Build unprotected header WITHOUT payload_len
             ByteArrayOutputStream headerBase = new ByteArrayOutputStream();
-            byte unprotectedFirstByte = (byte) (0xC0 | (pnLength - 1));  // Long header + Initial + PN length
+            
+            int typeBits = clientPacket.isVersion == 2 ? 0x01 : 0x00;  // Initial bit pattern
+            byte unprotectedFirstByte = (byte) (
+                0xC0 |                    // Long header
+                (typeBits << 4) |         // Packet type bits (5-4)
+                (pnLength - 1)            // Packet number length
+            );
+            
             headerBase.write(unprotectedFirstByte);
-            headerBase.write(QUIC_VERSION_1);
-            headerBase.write(dcid.length); headerBase.write(dcid);
-            headerBase.write(scid.length); headerBase.write(scid);
+            headerBase.write(clientPacket.version);  // Use client's version
+            headerBase.write(dcid.length); 
+            headerBase.write(dcid);
+            headerBase.write(scid.length); 
+            headerBase.write(scid);
             writeVariableLength(0, headerBase);               // Token length = 0
             int headerBaseSize = headerBase.size();
     
@@ -1281,18 +1348,130 @@ public class MinimalQuicServer {
             else if (extensionType == 0x0033) { // key_share
                 if(isReadable) { analyzeKeyShareExtension(tlsData, cursor, extensionLength); }
             }
-            else if (extensionType == 0x4469) { // quic_transport_parameters
-                System_out_println(" QUIC Transport Parameters extension");
+            else if (extensionType == 0x0039 || extensionType == 0x4469) { // quic_transport_parameters
+                //System_out_println(" QUIC Transport Parameters extension (" + 
+                //                   String.format("0x%04X", extensionType) + ")");
+                
+                // Now parse the parameters blob
+                if(isReadable) { parseQuicTransportParameters(tlsData, cursor, extensionLength, state); }
             }
             else if (extensionType == 0x002C) { 
                 state.isZeroRTT = true;
                 System_out_println(" QUIC 0-RTT extension");
-            }
-           
+            }          
             cursor += extensionLength;
         }
     }
-   
+  
+    private void parseQuicTransportParameters(byte[] data, int start, int length, ConnectionState state) {
+        int offset = start;
+        int end = start + length;
+    
+        System_out_println("   Parsing QUIC Transport Parameters (" + length + " bytes):");
+    
+        while (offset < end) {
+            // Read parameter ID (varint)
+            VarLenResult idResult = readVariableLength(data, offset);
+            if (idResult.size == 0) break;
+            offset += idResult.size;
+            long paramId = idResult.value;
+    
+            // Read parameter length (varint)
+            VarLenResult lenResult = readVariableLength(data, offset);
+            if (lenResult.size == 0) break;
+            offset += lenResult.size;
+            long paramLen = lenResult.value;
+    
+            if (offset + paramLen > end) {
+                System_out_println("     ? Truncated parameter 0x" + Long.toHexString(paramId));
+                break;
+            }
+    
+            String paramName = getTransportParamName(paramId);
+            System_out_println(String.format("     Param 0x%04X: %s (length %d)", paramId, paramName, paramLen));
+    
+            if ((int)paramId == 0x11) { // version_information
+                parseVersionInformation(data, offset, (int) paramLen, state);
+            }
+    
+            offset += paramLen;
+        }
+    }
+  
+    private void parseVersionInformation(byte[] data, int start, int length, ConnectionState state) {
+        if (length < 4 || length % 4 != 0) {
+            System_out_println("     ? Invalid version_information length: " + length);
+            return;
+        }
+    
+        System_out_println("     === version_information (RFC 9368) ===");
+    
+        int offset = start;
+        int numVersions = length / 4;
+    
+        // First 4 bytes: Chosen Version
+        int chosen = ((data[offset] & 0xFF) << 24) |
+                     ((data[offset+1] & 0xFF) << 16) |
+                     ((data[offset+2] & 0xFF) << 8) |
+                     (data[offset+3] & 0xFF);
+        offset += 4;
+    
+        String chosenHex = String.format("0x%08X", chosen);
+        String chosenName = getQuicVersionName(chosen);
+    
+        System_out_println("       Chosen Version : " + chosenHex + "  " + chosenName);
+    
+        // Remaining versions: Available Versions list
+        System_out_println("       Available Versions (" + (numVersions - 1) + "):");
+        for (int i = 1; i < numVersions; i++) {
+            int ver = ((data[offset] & 0xFF) << 24) |
+                      ((data[offset+1] & 0xFF) << 16) |
+                      ((data[offset+2] & 0xFF) << 8) |
+                      (data[offset+3] & 0xFF);
+            offset += 4;
+    
+            String verHex = String.format("0x%08X", ver);
+            String verName = getQuicVersionName(ver);
+    
+            System_out_println("         " + verHex + "  " + verName);
+     
+            // if (ver == QUIC_VERSION_2_VALUE) state.supportsQuicV2 = true;
+        }
+    }  
+
+    private String getQuicVersionName(int version) {
+        if (version == 0x00000001) return "(QUICv1)";
+        if (version == 0x6b3343cf) return "(QUICv2)";
+        if (version == 0x00000000) return "(Version Negotiation)";
+        return "";
+    }  
+  
+    private String getTransportParamName(long id) {
+        switch ((int) id) {
+            case 0x00: return "original_destination_connection_id";
+            case 0x01: return "max_idle_timeout";
+            case 0x02: return "stateless_reset_token";
+            case 0x03: return "max_udp_payload_size";
+            case 0x04: return "initial_max_data";
+            case 0x05: return "initial_max_stream_data_bidi_local";
+            case 0x06: return "initial_max_stream_data_bidi_remote";
+            case 0x07: return "initial_max_stream_data_uni";
+            case 0x08: return "initial_max_streams_bidi";
+            case 0x09: return "initial_max_streams_uni";
+            case 0x0a: return "ack_delay_exponent";
+            case 0x0b: return "max_ack_delay";
+            case 0x0c: return "disable_active_migration";
+            case 0x0d: return "preferred_address";
+            case 0x0e: return "active_connection_id_limit";
+            case 0x0f: return "initial_source_connection_id";
+            case 0x10: return "retry_source_connection_id";
+            case 0x11: return "version_information";
+            case 0x12: return "max_datagram_frame_size";
+            case 0x13: return "grease_quic_bit";
+            default: return "unknown_" + Long.toHexString(id);
+        }
+    }  
+      
     private void analyzeServerNameExtension(byte[] tlsData, int start, int length) {
         int cursor = start;
         if (cursor + 2 <= tlsData.length) {
@@ -1510,13 +1689,14 @@ public class MinimalQuicServer {
             case 0x001E: return "cookie";
             case 0x001F: return "psk";
             case 0x0020: return "early_data";
+            case 0x0022: return "delegated_credentials";
             case 0x0021: return "certificate_authorities";
             case 0x0029: return "pre_shared_key";
             case 0x002A: return "key_share";
             case 0x002B: return "supported_versions";
             case 0x002D: return "psk_key_exchange_modes";
             case 0x0033: return "key_share";
-            case 0x0039: return "delegated_credentials";
+            case 0x0039: return "quic_transport_parameters";
             case 0x003C: return "session_ticket";
             case 0x003D: return "key_share";
             case 0x4469: return "quic_transport_parameters";
@@ -1560,19 +1740,40 @@ public class MinimalQuicServer {
  
     private void System_out_print() { }
   
+    private String getInLabel(int version, boolean client) {
+        if (version == 2) {
+            return client ? "quicv2 client in" : "quicv2 server in";
+        } else {
+            return client ? "client in" : "server in";
+        }
+    }
+
+    private String getKeyLabel(int version) {
+        return version == 2 ? "quicv2 key" : "quic key";
+    }
+
+    private String getIvLabel(int version) {
+        return version == 2 ? "quicv2 iv" : "quic iv";
+    }
+
+    private String getHpLabel(int version) {
+        return version == 2 ? "quicv2 hp" : "quic hp";
+    }
+
     private static class QuicPacket {
         //byte[] rawData;
         boolean isLongHeader;
         boolean isInitial;
         byte type;
         byte[] version;
+        int isVersion;
         byte[] destinationConnectionId;
         byte[] sourceConnectionId;
         byte[] token = new byte[0];
         int payloadLength;
         //byte[] encryptedPayload;
         //byte[] header;
-        int pnLengthFromHeader;
+        //int pnLengthFromHeader;
         byte firstByte;
         long packetNumber;
     }
