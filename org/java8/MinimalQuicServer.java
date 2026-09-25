@@ -26,7 +26,7 @@ public class MinimalQuicServer {
     private Selector selector;
     private boolean running = true;
     private static final int MIN_INITIAL_SIZE = 1200;  // RFC 9000: Initial >= 1200 bytes
-    private static int AUTH_TAG_LENGTH = 16;
+    private static final int AUTH_TAG_LENGTH = 16;
       
     // QUIC 1 (RFC 9000)
     private static final byte[] QUIC_VERSION_1 = {(byte)0x00, (byte)0x00, (byte)0x00, (byte)0x01};
@@ -312,6 +312,10 @@ public class MinimalQuicServer {
     }
   
     private VarLenResult readVariableLength(byte[] data, int offset) {
+       if (offset < 0 || offset >= data.length) {
+           System_out_println("No remaining bytebuffer data: 0");
+           return new VarLenResult(0, 0);
+       }
        ByteBuffer buffer = ByteBuffer.wrap(data);
        buffer.position(offset);
        return readVariableLength(buffer);
@@ -490,7 +494,7 @@ public class MinimalQuicServer {
         }
         byte[] payload = new byte[encryptedPayloadLength];
         buffer.get(payload); //, 0, encryptedPayloadLength
-        byte[] nonce = computeNonce(clientIv, packetNumber, pnLength);
+        byte[] nonce = computeNonce(clientIv, packetNumber);
         System_out_println(" Nonce: " + bytesToHex(nonce) + " > cipher with tag len: " + payload.length + " > aad len: " + frameHeader.length);
         
         byte[] decryptedPayload = decryptAes128Gcm(clientKey, nonce, payload, frameHeader); //, authTag
@@ -589,7 +593,7 @@ public class MinimalQuicServer {
         }
     }
   
-    private byte[] computeNonce(byte[] iv, long packetNumber, int pnLength) {
+    private byte[] computeNonce(byte[] iv, long packetNumber) {
         ByteBuffer nonceInput = ByteBuffer.allocate(12);
         nonceInput.putInt(0);
         nonceInput.putLong(packetNumber);
@@ -662,11 +666,19 @@ public class MinimalQuicServer {
                 System_out_println(" ? Found CRYPTO frame (0x06)");
                
                 VarLenResult offsetResult = readVariableLength(data, offset);
+                if (offsetResult.size == 0) {
+                    System_out_println(" ? Truncated CRYPTO frame offset");
+                    break;
+                }
                 offset += offsetResult.size;
                
                 long cryptoOffset = offsetResult.value;
                
                 VarLenResult lengthResult = readVariableLength(data, offset);
+                if (lengthResult.size == 0 || lengthResult.value > data.length - offset - lengthResult.size) {
+                    System_out_println(" ? Truncated CRYPTO frame length");
+                    break;
+                }
                 offset += lengthResult.size;
                
                 int cryptoDataLength = (int)lengthResult.value;
@@ -946,7 +958,7 @@ public class MinimalQuicServer {
             byte[] aad = aadStream.toByteArray();
     
             // 10. Encrypt payloadPlain
-            byte[] nonce = computeNonce(serverIv, packetNumber, pnLength);
+            byte[] nonce = computeNonce(serverIv, packetNumber);
             byte[] encryptedPayload = encryptAes128Gcm(serverKey, nonce, payloadPlain, aad);
     
             if (encryptedPayload == null) {
@@ -1012,12 +1024,12 @@ public class MinimalQuicServer {
     
             // Mask first byte
             byte[] protectedHeader = unprotectedHeader.clone();
-            protectedHeader[0] ^= (mask[0] & 0x0F);
+            protectedHeader[0] = (byte) (protectedHeader[0] ^ (mask[0] & 0x0F));
     
             // Mask PN
             byte[] protectedPn = pnBytes.clone();
             for (int i = 0; i < pnLength; i++) {
-                protectedPn[i] ^= (byte) mask[i + 1];
+                protectedPn[i] = (byte) (protectedPn[i] ^ mask[i + 1]);
             }
     
             // 14. Assemble and send
@@ -1112,7 +1124,7 @@ public class MinimalQuicServer {
         packetBuffer.get(ciphertextWithTag);          
                                                                                        
         // Decrypt
-        byte[] nonce = computeNonce(iv, derivedPn, derivedPnLength);
+        byte[] nonce = computeNonce(iv, derivedPn);
         System_out_println(" Nonce test: " + bytesToHex(nonce) + " > cipher with tag len: " + ciphertextWithTag.length + " > aad len: " + aad.length);
         byte[] decryptedFrames = decryptAes128Gcm(key, nonce, ciphertextWithTag, aad);
     
@@ -1382,7 +1394,7 @@ public class MinimalQuicServer {
             offset += lenResult.size;
             long paramLen = lenResult.value;
     
-            if (offset + paramLen > end) {
+            if (paramLen > end - offset) {
                 System_out_println("     ? Truncated parameter 0x" + Long.toHexString(paramId));
                 break;
             }
@@ -1390,11 +1402,11 @@ public class MinimalQuicServer {
             String paramName = getTransportParamName(paramId);
             System_out_println(String.format("     Param 0x%04X: %s (length %d)", paramId, paramName, paramLen));
     
-            if ((int)paramId == 0x11) { // version_information
+            if (paramId == 0x11) { // version_information
                 parseVersionInformation(data, offset, (int) paramLen, state);
             }
     
-            offset += paramLen;
+            offset += (int) paramLen;
         }
     }
   
@@ -1605,7 +1617,7 @@ public class MinimalQuicServer {
         offset += firstRange.size;
        
         // ACK Ranges 
-        for (long i = 0; i < rangeCount.value - 1 && offset < data.length; i++) {
+        for (long i = 0; i < rangeCount.value && offset < data.length; i++) {
             // Gap
             VarLenResult gap = readVariableLength(data, offset);
             offset += gap.size;
